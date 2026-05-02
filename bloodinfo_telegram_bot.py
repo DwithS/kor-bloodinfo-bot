@@ -10,15 +10,19 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from bloodinfo_worker import Worker
 from database import (
+    add_favorite_site,
     add_subscription,
     cancel_subscription,
+    deactivate_duplicate_subscriptions,
     get_active_subscriptions,
     get_site_cache_refresh_date,
     get_user_credentials,
     init_db,
+    list_favorite_sites,
     list_subscriptions,
     mark_subscription_notified,
     refresh_sites_cache,
+    remove_favorite_site,
     resolve_site_codes_by_names,
     search_sites_by_region,
     upsert_user_credentials,
@@ -54,15 +58,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "1) 계정 등록 / 변경\n"
         "/register_account bloodinfo_id bloodinfo_password\n"
         "※ 이미 등록된 경우 새 정보로 덮어씌워집니다.\n\n"
-        "2) 알림 조건 등록\n"
-        "/add_subscription YYYY-MM-DD donation_types_csv site_names_csv\n"
-        "예: /add_subscription 2026-05-10 혈소판,혈장 해운대센터 헌혈의집,서면로센터\n"
-        "(헌혈방식: 전혈 / 혈장 / 혈소판 혹은 혈소판혈장)\n\n"
-        "3) 등록 확인\n"
+        "2) 즐겨찾기 사이트 관리\n"
+        "/add_favorite 사이트명\n"
+        "/remove_favorite 사이트명\n"
+        "/favorites\n\n"
+        "3) 알림 조건 등록\n"
+        "/add_subscription YYYY-MM-DD donation_types_csv [site_names_csv] [시작~종료]\n"
+        "예: /add_subscription 2026-05-10 혈소판,혈장\n"
+        "예: /add_subscription 2026-05-10 혈소판 해운대센터 헌혈의집,서면로센터\n"
+        "예: /add_subscription 2026-05-10 혈소판 해운대센터 헌혈의집 9~13\n"
+        "(사이트 미입력 시 즐겨찾기 사용, 헌혈방식: 전혈 / 혈장 / 혈소판 혹은 혈소판혈장)\n\n"
+        "4) 등록 확인\n"
         "/list_subscriptions\n\n"
-        "4) 등록 취소\n"
+        "5) 등록 취소\n"
         "/cancel_subscription subscription_id\n\n"
-        "5) 사이트 조회(시/도 필수, 키워드 선택)\n"
+        "6) 사이트 조회(시/도 필수, 키워드 선택)\n"
         "/sites 부산\n"
         "/sites 경기 산본"
     )
@@ -92,14 +102,74 @@ async def cmd_register_account(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("계정 정보가 변경되었습니다.")
 
 
+async def cmd_add_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None or update.message is None:
+        return
+
+    if not context.args:
+        await update.message.reply_text("사용법: /add_favorite 사이트명\n예: /add_favorite 해운대센터 헌혈의집")
+        return
+
+    site_name = " ".join(context.args).strip()
+    await _ensure_sites_cache(context.bot_data["db_path"])
+    site_codes, not_found = resolve_site_codes_by_names(context.bot_data["db_path"], [site_name])
+    if not_found:
+        await update.message.reply_text(
+            f"'{site_name}' 사이트를 찾지 못했습니다.\n/sites 시/도 [키워드] 로 정확한 이름을 확인해주세요."
+        )
+        return
+
+    added = add_favorite_site(context.bot_data["db_path"], update.effective_user.id, site_codes[0], site_name)
+    if added:
+        await update.message.reply_text(f"'{site_name}'을(를) 즐겨찾기에 추가했습니다.")
+    else:
+        await update.message.reply_text(f"'{site_name}'은(는) 이미 즐겨찾기에 있습니다.")
+
+
+async def cmd_remove_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None or update.message is None:
+        return
+
+    if not context.args:
+        await update.message.reply_text("사용법: /remove_favorite 사이트명")
+        return
+
+    site_name = " ".join(context.args).strip()
+    await _ensure_sites_cache(context.bot_data["db_path"])
+    site_codes, _ = resolve_site_codes_by_names(context.bot_data["db_path"], [site_name])
+    sitecode = site_codes[0] if site_codes else ""
+
+    removed = remove_favorite_site(context.bot_data["db_path"], update.effective_user.id, sitecode)
+    if removed:
+        await update.message.reply_text(f"'{site_name}'을(를) 즐겨찾기에서 삭제했습니다.")
+    else:
+        await update.message.reply_text(f"'{site_name}'을(를) 즐겨찾기에서 찾을 수 없습니다.")
+
+
+async def cmd_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None or update.message is None:
+        return
+
+    favorites = list_favorite_sites(context.bot_data["db_path"], update.effective_user.id)
+    if not favorites:
+        await update.message.reply_text("즐겨찾기가 없습니다. /add_favorite 사이트명 으로 추가하세요.")
+        return
+
+    lines = [f"{i+1}. {f['sitename']} ({f['sitecode']})" for i, f in enumerate(favorites)]
+    await update.message.reply_text("즐겨찾기:\n" + "\n".join(lines))
+
+
 async def cmd_add_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user is None or update.message is None:
         return
 
-    if len(context.args) != 3:
+    # 인자: YYYY-MM-DD donation_types [site_names] [시작~종료]
+    if len(context.args) < 2:
         await update.message.reply_text(
-            "사용법: /add_subscription YYYY-MM-DD donation_types_csv site_names_csv\n"
-            "예: /add_subscription 2026-05-10 혈소판,혈장 해운대센터 헌혈의집,서면로센터"
+            "사용법: /add_subscription YYYY-MM-DD donation_types_csv [site_names_csv] [시작~종료]\n"
+            "예: /add_subscription 2026-05-10 혈소판\n"
+            "예: /add_subscription 2026-05-10 혈소판 해운대센터 헌혈의집\n"
+            "예: /add_subscription 2026-05-10 혈소판 해운대센터 헌혈의집 9~13"
         )
         return
 
@@ -108,7 +178,20 @@ async def cmd_add_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("먼저 /register_account 로 계정을 등록해주세요.")
         return
 
-    date_text, donation_text, site_text = context.args
+    date_text = context.args[0]
+    donation_text = context.args[1]
+    # 나머지 인자에서 시간범위(숫자~숫자)와 사이트명을 분리
+    remaining = context.args[2:]
+    time_from: int | None = None
+    time_to: int | None = None
+    site_text_parts: list[str] = []
+    for token in remaining:
+        parsed_range = _parse_time_range(token)
+        if parsed_range is not None:
+            time_from, time_to = parsed_range
+        else:
+            site_text_parts.append(token)
+    site_text = " ".join(site_text_parts).strip()
 
     try:
         parsed_date = datetime.date.fromisoformat(date_text)
@@ -125,20 +208,36 @@ async def cmd_add_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("헌혈 방식이 잘못되었습니다. 전혈,혈장,혈소판 중에서 선택해주세요.")
         return
 
-    site_names = _parse_site_names(site_text)
-    if not site_names:
-        await update.message.reply_text("사이트 이름이 잘못되었습니다. 예: 해운대센터 헌혈의집,서면로센터")
-        return
-
+    # 사이트: 입력값 우선, 없으면 즐겨찾기 사용
     await _ensure_sites_cache(context.bot_data["db_path"])
-    site_codes, not_found = resolve_site_codes_by_names(context.bot_data["db_path"], site_names)
-    if not_found:
-        await update.message.reply_text(
-            "다음 사이트명을 찾지 못했습니다: "
-            + ", ".join(not_found)
-            + "\n/sites 시/도 [키워드] 로 검색 후 정확한 이름으로 입력해주세요."
-        )
-        return
+    if site_text:
+        site_names = _parse_site_names(site_text)
+        if not site_names:
+            await update.message.reply_text("사이트 이름이 잘못되었습니다.")
+            return
+        site_codes, not_found = resolve_site_codes_by_names(context.bot_data["db_path"], site_names)
+        if not_found:
+            await update.message.reply_text(
+                "다음 사이트명을 찾지 못했습니다: "
+                + ", ".join(not_found)
+                + "\n/sites 시/도 [키워드] 로 검색 후 정확한 이름으로 입력해주세요."
+            )
+            return
+        display_sites = site_names
+    else:
+        favorites = list_favorite_sites(context.bot_data["db_path"], update.effective_user.id)
+        if not favorites:
+            await update.message.reply_text(
+                "즐겨찾기가 없습니다. 사이트명을 직접 입력하거나 /add_favorite 로 즐겨찾기를 추가해주세요."
+            )
+            return
+        site_codes = [f["sitecode"] for f in favorites]
+        display_sites = [f["sitename"] for f in favorites]
+
+    # 동일 날짜 + 동일 헌혈방식 기존 구독 비활성화
+    deactivated = deactivate_duplicate_subscriptions(
+        context.bot_data["db_path"], update.effective_user.id, parsed_date.isoformat(), donation_types
+    )
 
     subscription_id = add_subscription(
         context.bot_data["db_path"],
@@ -146,14 +245,20 @@ async def cmd_add_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         parsed_date.isoformat(),
         donation_types,
         site_codes,
+        time_from,
+        time_to,
     )
 
     donation_labels = ",".join(DONATION_KEY_TO_LABEL[item] for item in donation_types)
+    time_range_text = f"\n시간: {time_from}~{time_to}시" if time_from is not None and time_to is not None else ""
+    deactivated_text = f"\n(기존 구독 {deactivated}건 비활성화)" if deactivated else ""
     await update.message.reply_text(
         f"등록 완료: #{subscription_id}\n"
         f"날짜: {parsed_date.isoformat()}\n"
         f"헌혈방식: {donation_labels}\n"
-        f"사이트: {', '.join(site_names)}"
+        f"사이트: {', '.join(display_sites)}"
+        f"{time_range_text}"
+        f"{deactivated_text}"
     )
 
 
@@ -170,8 +275,9 @@ async def cmd_list_subscriptions(update: Update, context: ContextTypes.DEFAULT_T
     for row in rows:
         donation_labels = ",".join(DONATION_KEY_TO_LABEL.get(item, item) for item in row["donation_types"])
         status = "활성" if row["is_active"] else "비활성"
+        time_range = f" | {row['time_from']}~{row['time_to']}시" if row.get("time_from") is not None else ""
         lines.append(
-            f"#{row['id']} | {status} | {row['target_date']} | {donation_labels} | sites={','.join(row['site_codes'])}"
+            f"#{row['id']} | {status} | {row['target_date']} | {donation_labels}{time_range} | sites={','.join(row['site_codes'])}"
         )
 
     await update.message.reply_text("\n".join(lines))
@@ -260,6 +366,21 @@ def _parse_site_names(raw_value: str) -> list[str]:
     return result
 
 
+def _parse_time_range(token: str) -> tuple[int, int] | None:
+    """'9~13' 형태를 (9, 13)으로 파싱. 실패 시 None 반환."""
+    if "~" not in token:
+        return None
+    parts = token.split("~", 1)
+    try:
+        time_from = int(parts[0].strip())
+        time_to = int(parts[1].strip())
+        if 0 <= time_from < time_to <= 24:
+            return time_from, time_to
+    except ValueError:
+        pass
+    return None
+
+
 def _fetch_sites_from_api() -> list[dict]:
     worker = Worker()
     try:
@@ -304,13 +425,21 @@ async def _send_lines_in_chunks(update: Update, lines: list[str], max_chars: int
         await update.message.reply_text("\n".join(chunk))
 
 
-def _build_notify_message(subscription_id: int, target_date: str, matches: list[tuple[str, list[str]]], donation_types: list[str]) -> str:
+def _build_notify_message(
+    subscription_id: int,
+    target_date: str,
+    matches: list[tuple[str, list[str]]],
+    donation_types: list[str],
+    time_from: int | None = None,
+    time_to: int | None = None,
+) -> str:
     donation_labels = ", ".join(DONATION_KEY_TO_LABEL.get(item, item) for item in donation_types)
+    time_range_text = f" ({time_from}~{time_to}시)" if time_from is not None and time_to is not None else ""
     lines = [
         "조건에 맞는 예약 가능 슬롯을 찾았습니다.",
         f"구독 ID: #{subscription_id}",
         f"날짜: {target_date}",
-        f"헌혈방식: {donation_labels}",
+        f"헌혈방식: {donation_labels}{time_range_text}",
         "",
     ]
 
@@ -328,6 +457,8 @@ def _check_one_subscription(sub: dict, passphrase: str) -> tuple[bool, str]:
     target_date = datetime.date.fromisoformat(sub["target_date"])
     donation_types = sub["donation_types"]
     site_codes = sub["site_codes"]
+    time_from: int | None = sub.get("time_from")
+    time_to: int | None = sub.get("time_to")
 
     worker = Worker()
     try:
@@ -340,13 +471,18 @@ def _check_one_subscription(sub: dict, passphrase: str) -> tuple[bool, str]:
             if not table:
                 continue
             times = worker.find_available_slots(table, donation_types)
+            if time_from is not None and time_to is not None:
+                times = [
+                    t for t in times
+                    if time_from <= int(t.split(":")[0]) < time_to
+                ]
             if times:
                 matches.append((site_code, times))
 
         if not matches:
             return False, ""
 
-        message = _build_notify_message(sub["id"], sub["target_date"], matches, donation_types)
+        message = _build_notify_message(sub["id"], sub["target_date"], matches, donation_types, time_from, time_to)
         return True, message
     finally:
         worker.close()
@@ -402,6 +538,9 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("register_account", cmd_register_account))
+    application.add_handler(CommandHandler("add_favorite", cmd_add_favorite))
+    application.add_handler(CommandHandler("remove_favorite", cmd_remove_favorite))
+    application.add_handler(CommandHandler("favorites", cmd_favorites))
     application.add_handler(CommandHandler("add_subscription", cmd_add_subscription))
     application.add_handler(CommandHandler("list_subscriptions", cmd_list_subscriptions))
     application.add_handler(CommandHandler("cancel_subscription", cmd_cancel_subscription))
