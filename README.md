@@ -1,5 +1,7 @@
 ## Redconnect Checker Telegram Bot
 
+github copilot의 도움을 받아 만들었습니다.
+
 사용자가 원하는 날짜, 헌혈방식, 사이트를 등록하면 30분마다 조회해서 조건이 맞는 시간대가 생길 때 텔레그램으로 1회 알림을 보냅니다.
 
 ## Setup
