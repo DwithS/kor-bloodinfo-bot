@@ -451,39 +451,59 @@ def _build_notify_message(
     return "\n".join(lines)
 
 
-def _check_one_subscription(sub: dict, passphrase: str) -> tuple[bool, str]:
-    user_id = decrypt_text(sub["bloodinfo_id_enc"], passphrase)
-    user_password = decrypt_text(sub["bloodinfo_pw_enc"], passphrase)
+def _check_subscription_with_worker(worker: Worker, sub: dict) -> tuple[bool, str]:
     target_date = datetime.date.fromisoformat(sub["target_date"])
     donation_types = sub["donation_types"]
     site_codes = sub["site_codes"]
     time_from: int | None = sub.get("time_from")
     time_to: int | None = sub.get("time_to")
 
+    matches: list[tuple[str, list[str]]] = []
+    for site_code in site_codes:
+        table = worker.fetch_time_table(site_code, target_date)
+        if not table:
+            continue
+        times = worker.find_available_slots(table, donation_types)
+        if time_from is not None and time_to is not None:
+            times = [
+                t for t in times
+                if time_from <= int(t.split(":")[0]) < time_to
+            ]
+        if times:
+            matches.append((site_code, times))
+
+    if not matches:
+        return False, ""
+
+    message = _build_notify_message(sub["id"], sub["target_date"], matches, donation_types, time_from, time_to)
+    return True, message
+
+
+def _check_user_subscriptions(subscriptions: list[dict], passphrase: str) -> list[tuple[int, int, str]]:
+    if not subscriptions:
+        return []
+
+    user_id = decrypt_text(subscriptions[0]["bloodinfo_id_enc"], passphrase)
+    user_password = decrypt_text(subscriptions[0]["bloodinfo_pw_enc"], passphrase)
+    telegram_user_id = subscriptions[0]["telegram_user_id"]
+
     worker = Worker()
     try:
+        logger.info(
+            "텔레그램 사용자 %s 검사 시작: 구독 %s건, 로그인 1회 수행",
+            telegram_user_id,
+            len(subscriptions),
+        )
         if not worker.login(user_id, user_password):
-            return False, ""
+            logger.warning("텔레그램 사용자 %s 로그인 실패", telegram_user_id)
+            return []
 
-        matches: list[tuple[str, list[str]]] = []
-        for site_code in site_codes:
-            table = worker.fetch_time_table(site_code, target_date)
-            if not table:
-                continue
-            times = worker.find_available_slots(table, donation_types)
-            if time_from is not None and time_to is not None:
-                times = [
-                    t for t in times
-                    if time_from <= int(t.split(":")[0]) < time_to
-                ]
-            if times:
-                matches.append((site_code, times))
-
-        if not matches:
-            return False, ""
-
-        message = _build_notify_message(sub["id"], sub["target_date"], matches, donation_types, time_from, time_to)
-        return True, message
+        matched_messages: list[tuple[int, int, str]] = []
+        for sub in subscriptions:
+            matched, message = _check_subscription_with_worker(worker, sub)
+            if matched:
+                matched_messages.append((sub["id"], sub["telegram_user_id"], message))
+        return matched_messages
     finally:
         worker.close()
 
@@ -495,28 +515,52 @@ async def run_polling_iteration(bot, db_path: str, passphrase: str, target_user_
 
     notified_count = 0
     today = datetime.date.today()
+    valid_subscriptions: list[dict] = []
     for sub in subscriptions:
-        try:
-            if datetime.date.fromisoformat(sub["target_date"]) <= today:
-                mark_subscription_notified(db_path, sub["id"])
-                logger.info("구독 #%s 대상 날짜 만료로 비활성화", sub["id"])
-                continue
-            matched, message = await asyncio.to_thread(_check_one_subscription, sub, passphrase)
-            if not matched:
-                continue
-            await bot.send_message(chat_id=sub["telegram_user_id"], text=message)
+        if datetime.date.fromisoformat(sub["target_date"]) <= today:
             mark_subscription_notified(db_path, sub["id"])
-            notified_count += 1
+            logger.info("구독 #%s 대상 날짜 만료로 비활성화", sub["id"])
+            continue
+        valid_subscriptions.append(sub)
+
+    subscriptions_by_user: dict[int, list[dict]] = {}
+    for sub in valid_subscriptions:
+        subscriptions_by_user.setdefault(sub["telegram_user_id"], []).append(sub)
+
+    logger.info(
+        "폴링 대상 구독 %s건, 사용자 %s명",
+        len(valid_subscriptions),
+        len(subscriptions_by_user),
+    )
+
+    for telegram_user_id, user_subscriptions in subscriptions_by_user.items():
+        try:
+            matched_messages = await asyncio.to_thread(_check_user_subscriptions, user_subscriptions, passphrase)
+            for subscription_id, chat_id, message in matched_messages:
+                await bot.send_message(chat_id=chat_id, text=message)
+                mark_subscription_notified(db_path, subscription_id)
+                notified_count += 1
         except EncryptionError:
-            logger.exception("구독 #%s 복호화 실패", sub["id"])
+            logger.exception("텔레그램 사용자 %s 복호화 실패", telegram_user_id)
         except Exception:
-            logger.exception("구독 #%s 검사 중 오류", sub["id"])
+            logger.exception("텔레그램 사용자 %s 검사 중 오류", telegram_user_id)
     return notified_count
 
 
 async def polling_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("주기 검사 작업 시작")
     count = await run_polling_iteration(context.bot, context.bot_data["db_path"], context.bot_data["enc_passphrase"])
     logger.info("주기 검사 완료, 알림 %s건 발송", count)
+
+
+async def post_init(application: Application) -> None:
+    job_queue = application.job_queue
+    if job_queue is None:
+        logger.warning("JobQueue를 사용할 수 없습니다.")
+        return
+
+    jobs = job_queue.jobs()
+    logger.info("JobQueue 초기화 완료, 등록된 작업: %s", [job.name for job in jobs])
 
 
 def main() -> None:
@@ -532,7 +576,7 @@ def main() -> None:
 
     init_db(db_path)
 
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(token).post_init(post_init).build()
     application.bot_data["db_path"] = db_path
     application.bot_data["enc_passphrase"] = passphrase
 
@@ -556,6 +600,7 @@ def main() -> None:
         first=datetime.timedelta(seconds=15),
         name="bloodinfo-check-job",
     )
+    logger.info("주기 검사 작업 등록 완료: interval=%s분, first=15초", poll_interval_minutes)
 
     logger.info("텔레그램 봇 시작")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
