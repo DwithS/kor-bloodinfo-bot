@@ -86,6 +86,16 @@ def init_db(db_path: str) -> None:
             "CREATE INDEX IF NOT EXISTS idx_sites_sitename ON sites (sitename)"
         )
 
+        # Backward-compatible migration for old DB files.
+        subscription_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(subscriptions)").fetchall()
+        }
+        if "time_from" not in subscription_columns:
+            conn.execute("ALTER TABLE subscriptions ADD COLUMN time_from INTEGER")
+        if "time_to" not in subscription_columns:
+            conn.execute("ALTER TABLE subscriptions ADD COLUMN time_to INTEGER")
+
 
 def upsert_user_credentials(db_path: str, telegram_user_id: int, bloodinfo_id_enc: str, bloodinfo_pw_enc: str) -> None:
     now = datetime.utcnow().isoformat()
@@ -180,7 +190,9 @@ def list_subscriptions(db_path: str, telegram_user_id: int) -> list[dict[str, An
     with _connect(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT id, target_date, donation_types_json, site_codes_json, is_active, notified_at, created_at
+            SELECT id, target_date, donation_types_json, site_codes_json,
+                   time_from, time_to,
+                   is_active, notified_at, created_at
             FROM subscriptions
             WHERE telegram_user_id = ?
             ORDER BY id DESC
