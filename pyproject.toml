@@ -1,0 +1,14 @@
+
+[project]
+name = "redconnect-checker"
+version = "0.1.0"
+dependencies = [
+	"curl_cffi",
+	"pycryptodome",
+	"beautifulsoup4",
+	"python-dotenv",
+	"python-telegram-bot[job-queue]"
+]
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
